@@ -5,15 +5,20 @@ import foodRouter from './routes/foodRoute.js'
 import userRouter from './routes/userRoute.js';
 import 'dotenv/config';
 import cartRouter from './routes/cartRoute.js';
-import orderRouter from './routes/orderRoute.js';
-
+import orderRouter from './routes/orderRoute.js';   
+dotenv.config()
 //app config
 const app = express()
-const port = 4000
+const port = process.env.PORT
+
 
 // middleware
 app.use(express.json())
-app.use(cors())
+app.use(cors({
+  origin: "https://cafeteria108.netlify.app",
+  methods: ["GET", "POST", "PUT", "DELETE"],
+  credentials: true
+}));
 
 //db connection
 connectDB();
