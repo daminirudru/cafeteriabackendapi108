@@ -40,6 +40,55 @@ const foodSchema = new mongoose.Schema({
 
 const Food = mongoose.model('Food', foodSchema);
 
+// Simple Order Model
+const orderSchema = new mongoose.Schema({
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    orderNumber: { type: String, unique: true },
+    items: [{
+        foodId: { type: mongoose.Schema.Types.ObjectId, ref: 'Food' },
+        name: String,
+        price: Number,
+        quantity: Number,
+        image: String
+    }],
+    amount: { type: Number, required: true },
+    deliveryFee: { type: Number, default: 2 },
+    totalAmount: { type: Number, required: true },
+    address: {
+        firstName: String,
+        lastName: String,
+        email: String,
+        street: String,
+        city: String,
+        state: String,
+        zipcode: String,
+        country: String,
+        phone: String
+    },
+    status: {
+        type: String,
+        enum: ['Food Processing', 'Confirmed', 'Preparing', 'Out for delivery', 'Delivered', 'Cancelled'],
+        default: 'Food Processing'
+    },
+    paymentStatus: {
+        type: String,
+        enum: ['Pending', 'Paid', 'Failed'],
+        default: 'Pending'
+    },
+    paymentId: String
+}, { timestamps: true });
+
+// Generate order number before saving
+orderSchema.pre('save', async function (next) {
+    if (this.isNew && !this.orderNumber) {
+        const count = await this.constructor.countDocuments();
+        this.orderNumber = `ORD-${Date.now()}-${(count + 1).toString().padStart(4, '0')}`;
+    }
+    next();
+});
+
+const Order = mongoose.model('Order', orderSchema);
+
 // Helper function
 const createToken = (id) => {
     return jwt.sign({ id }, process.env.JWT_SECRET || 'fallback-secret', { expiresIn: '7d' });
@@ -66,8 +115,8 @@ app.get('/', (req, res) => {
             'DELETE /api/cart/clear': 'Clear cart',
 
             // Order endpoints (require authentication)
-            'POST /api/order/place': 'Place order',
-            'POST /api/order/userorders': 'Get user orders'
+            'POST /api/order/place': 'Place order from cart with delivery address',
+            'POST /api/order/userorders': 'Get user order history with pagination'
         },
         note: 'Cart and Order endpoints require authentication token in headers'
     });
@@ -374,24 +423,128 @@ app.delete('/api/cart/clear', authMiddleware, async (req, res) => {
     }
 });
 
-// Order routes (basic implementation)
+// Order routes
 app.post('/api/order/place', authMiddleware, async (req, res) => {
     try {
         console.log('📦 Place order request:', req.body);
 
-        res.json({
+        const { address, paymentId } = req.body;
+        const userId = req.body.userId;
+
+        // Validate required address fields
+        if (!address || !address.firstName || !address.lastName || !address.email ||
+            !address.street || !address.city || !address.state || !address.zipcode ||
+            !address.country || !address.phone) {
+            console.log('❌ Address validation failed. Received address:', address);
+            return res.status(400).json({
+                success: false,
+                message: 'Complete delivery address is required',
+                missingFields: {
+                    firstName: !address?.firstName,
+                    lastName: !address?.lastName,
+                    email: !address?.email,
+                    street: !address?.street,
+                    city: !address?.city,
+                    state: !address?.state,
+                    zipcode: !address?.zipcode,
+                    country: !address?.country,
+                    phone: !address?.phone
+                }
+            });
+        }
+
+        // Get user and cart data
+        const user = await User.findById(userId);
+        if (!user) {
+            return res.status(404).json({
+                success: false,
+                message: 'User not found'
+            });
+        }
+
+        const cartData = user.cartData || {};
+        const cartItems = Object.entries(cartData).filter(([_, quantity]) => quantity > 0);
+
+        if (cartItems.length === 0) {
+            return res.status(400).json({
+                success: false,
+                message: 'Cart is empty'
+            });
+        }
+
+        // Build order items with current prices
+        const orderItems = [];
+        let subtotal = 0;
+
+        for (const [itemId, quantity] of cartItems) {
+            const foodItem = await Food.findById(itemId);
+            if (!foodItem) {
+                return res.status(400).json({
+                    success: false,
+                    message: `Food item not found: ${itemId}`
+                });
+            }
+
+            if (!foodItem.isAvailable) {
+                return res.status(400).json({
+                    success: false,
+                    message: `Food item is no longer available: ${foodItem.name}`
+                });
+            }
+
+            const itemTotal = foodItem.price * quantity;
+            subtotal += itemTotal;
+
+            orderItems.push({
+                foodId: foodItem._id,
+                name: foodItem.name,
+                price: foodItem.price,
+                quantity: quantity,
+                image: foodItem.image
+            });
+        }
+
+        const deliveryFee = 2;
+        const totalAmount = subtotal + deliveryFee;
+
+        // Create order
+        const order = new Order({
+            userId: userId,
+            items: orderItems,
+            amount: subtotal,
+            deliveryFee: deliveryFee,
+            totalAmount: totalAmount,
+            address: address,
+            status: 'Food Processing',
+            paymentStatus: 'Pending',
+            paymentId: paymentId || null
+        });
+
+        await order.save();
+
+        // Clear user's cart
+        await User.findByIdAndUpdate(userId, { cartData: {} });
+
+        console.log('✅ Order placed successfully:', order.orderNumber);
+
+        res.status(201).json({
             success: true,
-            message: 'Order placement - coming soon!',
+            message: 'Order placed successfully',
             data: {
-                orderId: 'temp-' + Date.now(),
-                message: 'Order functionality will be implemented soon'
+                orderId: order._id,
+                orderNumber: order.orderNumber,
+                totalAmount: order.totalAmount,
+                status: order.status,
+                estimatedDelivery: '30-45 minutes',
+                items: orderItems,
+                address: address
             }
         });
     } catch (error) {
         console.error('❌ Place order error:', error);
         res.status(500).json({
             success: false,
-            message: 'Failed to place order'
+            message: 'Failed to place order: ' + error.message
         });
     }
 });
@@ -400,16 +553,66 @@ app.post('/api/order/userorders', authMiddleware, async (req, res) => {
     try {
         console.log('📋 Get user orders request for user:', req.body.userId);
 
+        const userId = req.body.userId;
+        const { page = 1, limit = 10 } = req.body;
+
+        // Calculate pagination
+        const skip = (page - 1) * limit;
+
+        // Get orders for user, sorted by creation date (newest first)
+        const orders = await Order.find({ userId })
+            .sort({ createdAt: -1 })
+            .skip(skip)
+            .limit(parseInt(limit))
+            .populate('items.foodId', 'name description category isAvailable');
+
+        // Get total count for pagination
+        const totalOrders = await Order.countDocuments({ userId });
+        const totalPages = Math.ceil(totalOrders / limit);
+
+        // Format orders for response
+        const formattedOrders = orders.map(order => ({
+            _id: order._id,
+            orderNumber: order.orderNumber,
+            items: order.items.map(item => ({
+                _id: item.foodId?._id || item.foodId,
+                name: item.name,
+                price: item.price,
+                quantity: item.quantity,
+                image: item.image,
+                total: item.price * item.quantity,
+                isAvailable: item.foodId?.isAvailable || false
+            })),
+            amount: order.amount,
+            deliveryFee: order.deliveryFee,
+            totalAmount: order.totalAmount,
+            address: order.address,
+            status: order.status,
+            paymentStatus: order.paymentStatus,
+            paymentId: order.paymentId,
+            createdAt: order.createdAt,
+            updatedAt: order.updatedAt
+        }));
+
+        console.log(`✅ Retrieved ${orders.length} orders for user`);
+
         res.json({
             success: true,
-            data: [],
-            message: 'No orders found (order system coming soon)'
+            data: formattedOrders,
+            pagination: {
+                currentPage: parseInt(page),
+                totalPages,
+                totalOrders,
+                hasNextPage: page < totalPages,
+                hasPrevPage: page > 1
+            },
+            message: orders.length > 0 ? `Found ${orders.length} orders` : 'No orders found'
         });
     } catch (error) {
         console.error('❌ Get orders error:', error);
         res.status(500).json({
             success: false,
-            message: 'Failed to get orders'
+            message: 'Failed to get orders: ' + error.message
         });
     }
 });
